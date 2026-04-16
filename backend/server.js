@@ -8,12 +8,11 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Инициализация SQLite (файл database.db создастся автоматически)
+// Инициализация SQLite
 const db = new Database('database.db');
 
-// Создание всех таблиц
+// Создание таблиц с проверкой существования
 db.exec(`
-  -- Таблица пользователей
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     nickname TEXT NOT NULL,
@@ -22,7 +21,6 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
-  -- Таблица заявок
   CREATE TABLE IF NOT EXISTS tickets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
@@ -36,7 +34,6 @@ db.exec(`
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
 
-  -- Таблица комментариев
   CREATE TABLE IF NOT EXISTS comments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ticket_id INTEGER,
@@ -47,25 +44,27 @@ db.exec(`
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
 
-  -- Создаем индексы для ускорения запросов
   CREATE INDEX IF NOT EXISTS idx_tickets_user_id ON tickets(user_id);
   CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
   CREATE INDEX IF NOT EXISTS idx_comments_ticket_id ON comments(ticket_id);
 `);
 
-db.exec(`
-  ALTER TABLE users ADD COLUMN avatar TEXT;
-`.replace(/\n/g, ' '), (err) => {
-  if (err && !err.message.includes('duplicate column name')) {
-    console.log('Avatar column already exists or error:', err);
+// Добавляем колонку avatar, если её нет
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN avatar TEXT`);
+  console.log('✅ Колонка avatar добавлена');
+} catch (err) {
+  if (err.message.includes('duplicate column name')) {
+    console.log('ℹ️ Колонка avatar уже существует');
+  } else {
+    console.log('⚠️ Ошибка при добавлении avatar:', err.message);
   }
-});
+}
 
 console.log('✅ База данных инициализирована');
 
-// Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // Увеличиваем лимит для аватарок
 
 // Middleware для проверки JWT токена
 const authenticateToken = (req, res, next) => {
@@ -87,7 +86,6 @@ const authenticateToken = (req, res, next) => {
 
 // ============= AUTH ROUTES =============
 
-// Регистрация
 app.post('/api/auth/register', async (req, res) => {
   const { nickname, email, password } = req.body;
   
@@ -96,14 +94,11 @@ app.post('/api/auth/register', async (req, res) => {
   }
   
   try {
-    // Хешируем пароль
     const hashedPassword = await bcrypt.hash(password, 10);
     
-    // Сохраняем пользователя
     const stmt = db.prepare('INSERT INTO users (nickname, email, password_hash) VALUES (?, ?, ?)');
     const result = stmt.run(nickname, email, hashedPassword);
     
-    // Создаем JWT токен
     const token = jwt.sign(
       { userId: result.lastInsertRowid, email },
       process.env.JWT_SECRET || 'super_secret_key_2024',
@@ -128,7 +123,6 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// Вход
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   
@@ -169,9 +163,117 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// ============= PROFILE ROUTES =============
+
+// Получить профиль
+app.get('/api/profile', authenticateToken, (req, res) => {
+  try {
+    const stmt = db.prepare('SELECT id, nickname, email, avatar, created_at FROM users WHERE id = ?');
+    const user = stmt.get(req.userId);
+    
+    if (!user) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+    
+    res.json(user);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Ошибка при получении профиля' });
+  }
+});
+
+// Обновить профиль
+app.put('/api/profile', authenticateToken, async (req, res) => {
+  const { nickname } = req.body;
+  
+  try {
+    const stmt = db.prepare(`
+      UPDATE users 
+      SET nickname = COALESCE(?, nickname)
+      WHERE id = ?
+      RETURNING id, nickname, email, avatar
+    `);
+    
+    const user = stmt.get(nickname, req.userId);
+    
+    if (!user) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+    
+    res.json(user);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Ошибка при обновлении профиля' });
+  }
+});
+
+// Сменить пароль
+app.put('/api/profile/password', authenticateToken, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ error: 'Все поля обязательны' });
+  }
+  
+  if (newPassword.length < 4) {
+    return res.status(400).json({ error: 'Пароль должен быть не менее 4 символов' });
+  }
+  
+  try {
+    const userStmt = db.prepare('SELECT password_hash FROM users WHERE id = ?');
+    const user = userStmt.get(req.userId);
+    
+    if (!user) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+    
+    const validPassword = await bcrypt.compare(currentPassword, user.password_hash);
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Неверный текущий пароль' });
+    }
+    
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    const updateStmt = db.prepare('UPDATE users SET password_hash = ? WHERE id = ?');
+    updateStmt.run(hashedPassword, req.userId);
+    
+    res.json({ message: 'Пароль успешно изменен' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Ошибка при смене пароля' });
+  }
+});
+
+// Загрузить аватарку
+app.post('/api/profile/avatar', authenticateToken, async (req, res) => {
+  const { avatar } = req.body;
+  
+  if (!avatar) {
+    return res.status(400).json({ error: 'Изображение не предоставлено' });
+  }
+  
+  try {
+    const stmt = db.prepare(`
+      UPDATE users 
+      SET avatar = ?
+      WHERE id = ?
+      RETURNING avatar
+    `);
+    
+    const result = stmt.get(avatar, req.userId);
+    
+    if (!result) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+    
+    res.json({ avatar: result.avatar });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Ошибка при загрузке аватарки' });
+  }
+});
+
 // ============= TICKETS ROUTES =============
 
-// Получить все заявки пользователя
 app.get('/api/tickets', authenticateToken, (req, res) => {
   try {
     const stmt = db.prepare(`
@@ -187,10 +289,8 @@ app.get('/api/tickets', authenticateToken, (req, res) => {
   }
 });
 
-// Получить одну заявку с комментариями
 app.get('/api/tickets/:id', authenticateToken, (req, res) => {
   try {
-    // Получаем заявку
     const ticketStmt = db.prepare('SELECT * FROM tickets WHERE id = ? AND user_id = ?');
     const ticket = ticketStmt.get(req.params.id, req.userId);
     
@@ -198,7 +298,6 @@ app.get('/api/tickets/:id', authenticateToken, (req, res) => {
       return res.status(404).json({ error: 'Заявка не найдена' });
     }
     
-    // Получаем комментарии
     const commentsStmt = db.prepare(`
       SELECT c.*, u.nickname 
       FROM comments c 
@@ -215,7 +314,6 @@ app.get('/api/tickets/:id', authenticateToken, (req, res) => {
   }
 });
 
-// Создать заявку
 app.post('/api/tickets', authenticateToken, (req, res) => {
   const { title, description, priority, category } = req.body;
   
@@ -246,7 +344,6 @@ app.post('/api/tickets', authenticateToken, (req, res) => {
   }
 });
 
-// Обновить заявку
 app.put('/api/tickets/:id', authenticateToken, (req, res) => {
   const { title, description, status, priority, category } = req.body;
   
@@ -279,7 +376,6 @@ app.put('/api/tickets/:id', authenticateToken, (req, res) => {
   }
 });
 
-// Удалить заявку
 app.delete('/api/tickets/:id', authenticateToken, (req, res) => {
   try {
     const stmt = db.prepare('DELETE FROM tickets WHERE id = ? AND user_id = ?');
@@ -298,7 +394,6 @@ app.delete('/api/tickets/:id', authenticateToken, (req, res) => {
 
 // ============= COMMENTS ROUTES =============
 
-// Добавить комментарий к заявке
 app.post('/api/tickets/:id/comments', authenticateToken, (req, res) => {
   const { text } = req.body;
   
@@ -307,7 +402,6 @@ app.post('/api/tickets/:id/comments', authenticateToken, (req, res) => {
   }
   
   try {
-    // Проверяем, существует ли заявка и принадлежит ли пользователю
     const checkStmt = db.prepare('SELECT id FROM tickets WHERE id = ? AND user_id = ?');
     const ticket = checkStmt.get(req.params.id, req.userId);
     
@@ -315,14 +409,12 @@ app.post('/api/tickets/:id/comments', authenticateToken, (req, res) => {
       return res.status(404).json({ error: 'Заявка не найдена' });
     }
     
-    // Добавляем комментарий
     const insertStmt = db.prepare(`
       INSERT INTO comments (ticket_id, user_id, text) 
       VALUES (?, ?, ?)
     `);
     const result = insertStmt.run(req.params.id, req.userId, text);
     
-    // Получаем добавленный комментарий с ником пользователя
     const getStmt = db.prepare(`
       SELECT c.*, u.nickname 
       FROM comments c 
@@ -340,7 +432,6 @@ app.post('/api/tickets/:id/comments', authenticateToken, (req, res) => {
 
 // ============= CATEGORIES ROUTES =============
 
-// Получить список категорий
 app.get('/api/categories', (req, res) => {
   res.json([
     { id: 1, name: 'Оборудование', icon: 'computer' },
@@ -359,115 +450,6 @@ app.get('/health', (req, res) => {
     database: 'SQLite'
   });
 });
-// ============= PROFILE ROUTES =============
-
-// Обновить профиль пользователя
-app.put('/api/profile', authenticateToken, async (req, res) => {
-  const { nickname } = req.body;
-  
-  try {
-    const stmt = db.prepare(`
-      UPDATE users 
-      SET nickname = COALESCE(?, nickname)
-      WHERE id = ?
-      RETURNING id, nickname, email
-    `);
-    
-    const user = stmt.get(nickname, req.userId);
-    
-    if (!user) {
-      return res.status(404).json({ error: 'Пользователь не найден' });
-    }
-    
-    res.json(user);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Ошибка при обновлении профиля' });
-  }
-});
-
-// Сменить пароль
-app.put('/api/profile/password', authenticateToken, async (req, res) => {
-  const { currentPassword, newPassword } = req.body;
-  
-  if (!currentPassword || !newPassword) {
-    return res.status(400).json({ error: 'Все поля обязательны' });
-  }
-  
-  if (newPassword.length < 4) {
-    return res.status(400).json({ error: 'Пароль должен быть не менее 4 символов' });
-  }
-  
-  try {
-    // Получаем текущего пользователя
-    const userStmt = db.prepare('SELECT password_hash FROM users WHERE id = ?');
-    const user = userStmt.get(req.userId);
-    
-    if (!user) {
-      return res.status(404).json({ error: 'Пользователь не найден' });
-    }
-    
-    // Проверяем текущий пароль
-    const validPassword = await bcrypt.compare(currentPassword, user.password_hash);
-    if (!validPassword) {
-      return res.status(401).json({ error: 'Неверный текущий пароль' });
-    }
-    
-    // Хешируем новый пароль
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
-    
-    // Обновляем пароль
-    const updateStmt = db.prepare('UPDATE users SET password_hash = ? WHERE id = ?');
-    updateStmt.run(hashedPassword, req.userId);
-    
-    res.json({ message: 'Пароль успешно изменен' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Ошибка при смене пароля' });
-  }
-});
-
-// Загрузить аватарку (сохраняем base64)
-app.post('/api/profile/avatar', authenticateToken, async (req, res) => {
-  const { avatar } = req.body;
-  
-  try {
-    const stmt = db.prepare(`
-      UPDATE users 
-      SET avatar = ?
-      WHERE id = ?
-      RETURNING id, nickname, email, avatar
-    `);
-    
-    const user = stmt.get(avatar, req.userId);
-    
-    if (!user) {
-      return res.status(404).json({ error: 'Пользователь не найден' });
-    }
-    
-    res.json({ avatar: user.avatar });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Ошибка при загрузке аватарки' });
-  }
-});
-
-// Получить профиль
-app.get('/api/profile', authenticateToken, (req, res) => {
-  try {
-    const stmt = db.prepare('SELECT id, nickname, email, avatar, created_at FROM users WHERE id = ?');
-    const user = stmt.get(req.userId);
-    
-    if (!user) {
-      return res.status(404).json({ error: 'Пользователь не найден' });
-    }
-    
-    res.json(user);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Ошибка при получении профиля' });
-  }
-});
 
 // ============= ЗАПУСК СЕРВЕРА =============
 app.listen(PORT, '0.0.0.0', () => {
@@ -477,6 +459,10 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n📝 Доступные маршруты:`);
   console.log(`   POST /api/auth/register - регистрация`);
   console.log(`   POST /api/auth/login - вход`);
+  console.log(`   GET  /api/profile - профиль`);
+  console.log(`   PUT  /api/profile - обновить профиль`);
+  console.log(`   POST /api/profile/avatar - загрузить аватарку`);
+  console.log(`   PUT  /api/profile/password - сменить пароль`);
   console.log(`   GET  /api/tickets - все заявки`);
   console.log(`   POST /api/tickets - создать заявку`);
   console.log(`   PUT  /api/tickets/:id - обновить заявку`);
